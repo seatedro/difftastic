@@ -292,24 +292,32 @@ impl Highlight {
     }
 }
 
-pub(crate) fn print_directory(diffs: Vec<DiffResult>, print_unchanged: bool) {
+pub(crate) fn serialize_directory(
+    diffs: Vec<DiffResult>,
+    print_unchanged: bool,
+) -> Result<String, serde_json::Error> {
     let files = diffs
         .iter()
         .map(File::from)
         .filter(|f| print_unchanged || f.status != Status::Unchanged)
         .collect::<Vec<File>>();
+    serde_json::to_string(&files)
+}
+
+pub(crate) fn print_directory(diffs: Vec<DiffResult>, print_unchanged: bool) {
     println!(
         "{}",
-        serde_json::to_string(&files).expect("failed to serialize files")
+        serialize_directory(diffs, print_unchanged).expect("failed to serialize files")
     );
 }
 
-pub(crate) fn print(diff: &DiffResult) {
+pub(crate) fn serialize(diff: &DiffResult) -> Result<String, serde_json::Error> {
     let file = File::from(diff);
-    println!(
-        "{}",
-        serde_json::to_string(&file).expect("failed to serialize file")
-    )
+    serde_json::to_string(&file)
+}
+
+pub(crate) fn print(diff: &DiffResult) {
+    println!("{}", serialize(diff).expect("failed to serialize file"))
 }
 
 fn add_changes_to_side<'s>(

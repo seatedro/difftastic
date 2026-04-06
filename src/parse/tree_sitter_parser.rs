@@ -10,6 +10,7 @@ use crate::hash::{DftHashMap, DftHashSet};
 use crate::options::DiffOptions;
 use crate::parse::guess_language as guess;
 use crate::parse::syntax::{AtomKind, Syntax};
+use crate::{DifftasticError, HighlightKind, HighlightSpan};
 
 /// A language may contain certain nodes that are in other languages
 /// and should be parsed as such (e.g. HTML `<script>` nodes
@@ -1181,6 +1182,110 @@ pub(crate) fn from_language(language: guess::Language) -> TreeSitterConfig {
                 sub_languages: vec![],
             }
         }
+    }
+}
+
+pub(crate) fn highlight_ranges(
+    source: &str,
+    language: guess::Language,
+) -> Result<Vec<HighlightSpan>, DifftasticError> {
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let config = from_language(language);
+    let mut parser = ts::Parser::new();
+    parser
+        .set_language(&config.language)
+        .map_err(|error| DifftasticError::new(error.to_string()))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| DifftasticError::new("tree-sitter parse failed"))?;
+
+    let capture_kinds = config
+        .highlight_query
+        .capture_names()
+        .iter()
+        .map(|name| capture_name_to_highlight_kind(name))
+        .collect::<Vec<_>>();
+    let mut cursor = ts::QueryCursor::new();
+    let mut captures =
+        cursor.captures(&config.highlight_query, tree.root_node(), source.as_bytes());
+    let mut raw_spans = Vec::new();
+
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = query_match.captures[*capture_index];
+        let kind = capture_kinds
+            .get(capture.index as usize)
+            .copied()
+            .unwrap_or(HighlightKind::Normal);
+        if kind == HighlightKind::Normal {
+            continue;
+        }
+
+        let node = capture.node;
+        let start = node.start_byte();
+        let end = node.end_byte();
+        if end > start {
+            raw_spans.push((start, end, kind, query_match.pattern_index));
+        }
+    }
+
+    raw_spans.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| right.3.cmp(&left.3)));
+    let mut covered = 0usize;
+    let mut result = Vec::with_capacity(raw_spans.len());
+    for (start, end, kind, _) in raw_spans {
+        if start < covered {
+            continue;
+        }
+        result.push(HighlightSpan {
+            offset: start as u32,
+            length: (end - start) as u32,
+            kind,
+        });
+        covered = end;
+    }
+
+    Ok(result)
+}
+
+fn capture_name_to_highlight_kind(name: &str) -> HighlightKind {
+    if name.starts_with("keyword") {
+        HighlightKind::Keyword
+    } else if name.starts_with("string") || name.starts_with("escape") {
+        HighlightKind::String
+    } else if name.starts_with("comment") {
+        HighlightKind::Comment
+    } else if name.starts_with("number") {
+        HighlightKind::Number
+    } else if name.starts_with("type") || name.starts_with("constructor") {
+        HighlightKind::Type
+    } else if name.starts_with("function") {
+        HighlightKind::Function
+    } else if name.starts_with("operator") {
+        HighlightKind::Operator
+    } else if name.starts_with("punctuation") {
+        HighlightKind::Punctuation
+    } else if name.starts_with("variable") {
+        HighlightKind::Variable
+    } else if name.starts_with("constant") || name.starts_with("boolean") {
+        HighlightKind::Constant
+    } else if name.starts_with("builtin") {
+        HighlightKind::Builtin
+    } else if name.starts_with("attribute") {
+        HighlightKind::Attribute
+    } else if name.starts_with("tag") {
+        HighlightKind::Tag
+    } else if name.starts_with("property") {
+        HighlightKind::Property
+    } else if name.starts_with("module") || name.starts_with("namespace") {
+        HighlightKind::Namespace
+    } else if name.starts_with("label") {
+        HighlightKind::Label
+    } else if name.starts_with("preproc") {
+        HighlightKind::Preprocessor
+    } else {
+        HighlightKind::Normal
     }
 }
 
