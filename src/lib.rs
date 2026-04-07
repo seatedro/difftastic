@@ -184,7 +184,9 @@ pub fn diff_bytes_json(request: DiffRequest<'_>) -> Result<String, DifftasticErr
     Ok(display::json::serialize(&diff)?)
 }
 
-pub fn diff_bytes_semantic(request: DiffRequest<'_>) -> Result<SemanticDiffResult, DifftasticError> {
+pub fn diff_bytes_semantic(
+    request: DiffRequest<'_>,
+) -> Result<SemanticDiffResult, DifftasticError> {
     let lhs_path =
         file_argument_for_side(request.lhs_path, request.display_path, request.lhs_bytes);
     let rhs_path =
@@ -210,7 +212,9 @@ pub fn diff_bytes_semantic(request: DiffRequest<'_>) -> Result<SemanticDiffResul
 
 fn convert_to_semantic(result: &DiffResult) -> SemanticDiffResult {
     use crate::display::context::{all_matched_lines_filled, opposite_positions};
-    use crate::display::hunks::{matched_lines_indexes_for_hunk, matched_pos_to_hunks, merge_adjacent};
+    use crate::display::hunks::{
+        matched_lines_indexes_for_hunk, matched_pos_to_hunks, merge_adjacent,
+    };
     use crate::display::side_by_side::lines_with_novel;
     use crate::lines::MaxLine;
 
@@ -291,8 +295,7 @@ fn convert_to_semantic(result: &DiffResult) -> SemanticDiffResult {
             let mut chunks = Vec::with_capacity(hunks.len());
 
             for hunk in &hunks {
-                let (start_i, end_i) =
-                    matched_lines_indexes_for_hunk(matched_lines_slice, hunk, 0);
+                let (start_i, end_i) = matched_lines_indexes_for_hunk(matched_lines_slice, hunk, 0);
                 let aligned = &matched_lines_slice[start_i..end_i];
                 matched_lines_slice = &matched_lines_slice[start_i..];
 
