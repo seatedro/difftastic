@@ -36,6 +36,7 @@ extern crate log;
 
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use humansize::{format_size, FormatSizeOptions, BINARY};
 use line_numbers::LineNumber;
@@ -163,6 +164,48 @@ pub struct DiffRequest<'a> {
 }
 
 const SEMANTIC_CHUNK_MAX_DISTANCE: u32 = 4;
+const TIMINGS_ENV: &str = "DFT_TIMINGS";
+
+struct TimingLog<'a> {
+    display_path: &'a str,
+    start: Instant,
+    last: Instant,
+}
+
+impl<'a> TimingLog<'a> {
+    fn new(display_path: &'a str) -> Option<Self> {
+        std::env::var_os(TIMINGS_ENV).map(|_| {
+            let now = Instant::now();
+            Self {
+                display_path,
+                start: now,
+                last: now,
+            }
+        })
+    }
+
+    fn mark(&mut self, phase: &str) {
+        let now = Instant::now();
+        eprintln!(
+            "difftastic timing path={:?} phase={} elapsed_ms={:.3} total_ms={:.3}",
+            self.display_path,
+            phase,
+            duration_ms(now.duration_since(self.last)),
+            duration_ms(now.duration_since(self.start)),
+        );
+        self.last = now;
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn mark_timing(timing: &mut Option<&mut TimingLog<'_>>, phase: &str) {
+    if let Some(timing) = timing.as_mut() {
+        (**timing).mark(phase);
+    }
+}
 
 pub fn diff_bytes_json(request: DiffRequest<'_>) -> Result<String, DifftasticError> {
     let lhs_path =
@@ -267,12 +310,16 @@ fn diff_file_content_semantic(
     diff_options: &DiffOptions,
     overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
 ) -> SemanticDiffResult {
+    let mut timing = TimingLog::new(display_path);
     let guess_src = match rhs_path {
         FileArgument::DevNull => lhs_src,
         _ => rhs_src,
     };
 
     let language = guess(Path::new(display_path), guess_src, overrides);
+    if let Some(timing) = timing.as_mut() {
+        timing.mark("guess_language");
+    }
     let guessed_format = file_format_for_language(language);
     let lhs_is_dev_null = matches!(lhs_path, FileArgument::DevNull);
     let rhs_is_dev_null = matches!(rhs_path, FileArgument::DevNull);
@@ -281,6 +328,9 @@ fn diff_file_content_semantic(
     // the file-level status. This avoids loading parser packs for file list rows
     // whose contents are not rendered yet.
     if lhs_is_dev_null && !rhs_is_dev_null {
+        if let Some(timing) = timing.as_mut() {
+            timing.mark("created");
+        }
         return SemanticDiffResult {
             status: DiffStatus::Created,
             language: guessed_format.to_string(),
@@ -289,6 +339,9 @@ fn diff_file_content_semantic(
         };
     }
     if rhs_is_dev_null && !lhs_is_dev_null {
+        if let Some(timing) = timing.as_mut() {
+            timing.mark("deleted");
+        }
         return SemanticDiffResult {
             status: DiffStatus::Deleted,
             language: guessed_format.to_string(),
@@ -298,6 +351,9 @@ fn diff_file_content_semantic(
     }
 
     if lhs_src == rhs_src {
+        if let Some(timing) = timing.as_mut() {
+            timing.mark("unchanged_bytes");
+        }
         return SemanticDiffResult {
             status: DiffStatus::Unchanged,
             language: guessed_format.to_string(),
@@ -306,14 +362,18 @@ fn diff_file_content_semantic(
         };
     }
 
-    let positions = text_diff_positions(lhs_src, rhs_src, diff_options, language);
-    text_positions_to_semantic(
+    let positions = text_diff_positions(lhs_src, rhs_src, diff_options, language, timing.as_mut());
+    let result = text_positions_to_semantic(
         &positions.file_format,
         lhs_src,
         rhs_src,
         &positions.lhs_positions,
         &positions.rhs_positions,
-    )
+    );
+    if let Some(timing) = timing.as_mut() {
+        timing.mark("semantic_convert");
+    }
+    result
 }
 
 fn text_positions_to_semantic(
@@ -612,6 +672,7 @@ fn text_diff_positions(
     rhs_src: &str,
     diff_options: &DiffOptions,
     language: Option<Language>,
+    mut timing: Option<&mut TimingLog<'_>>,
 ) -> TextDiffPositions {
     let lang_config = language.and_then(|language| match tsp::from_language(language) {
         Ok(config) => Some((language, config)),
@@ -620,100 +681,123 @@ fn text_diff_positions(
             None
         }
     });
+    mark_timing(&mut timing, "language_config");
 
     match lang_config {
-        None => TextDiffPositions {
-            file_format: FileFormat::PlainText,
-            lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
-            rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
-        },
+        None => {
+            let result = TextDiffPositions {
+                file_format: FileFormat::PlainText,
+                lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
+                rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
+            };
+            mark_timing(&mut timing, "line_diff");
+            result
+        }
         Some((language, lang_config)) => {
             let arena = Arena::new();
-            match tsp::to_tree_with_limit(diff_options, &lang_config, lhs_src, rhs_src) {
-                Ok((lhs_tree, rhs_tree)) => match tsp::to_syntax_with_limit(
-                    lhs_src,
-                    rhs_src,
-                    &lhs_tree,
-                    &rhs_tree,
-                    &arena,
-                    &lang_config,
-                    diff_options,
-                ) {
-                    Ok((lhs, rhs)) => {
-                        let mut change_map = ChangeMap::default();
-                        let possibly_changed = if std::env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
-                            vec![(lhs.clone(), rhs.clone())]
-                        } else {
-                            unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
-                        };
+            let tree_result = tsp::to_tree_with_limit(diff_options, &lang_config, lhs_src, rhs_src);
+            mark_timing(&mut timing, "parse");
+            match tree_result {
+                Ok((lhs_tree, rhs_tree)) => {
+                    let syntax_result = tsp::to_syntax_with_limit(
+                        lhs_src,
+                        rhs_src,
+                        &lhs_tree,
+                        &rhs_tree,
+                        &arena,
+                        &lang_config,
+                        diff_options,
+                    );
+                    mark_timing(&mut timing, "syntax");
 
-                        let mut exceeded_graph_limit = false;
-                        for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
-                            init_next_prev(&lhs_section_nodes);
-                            init_next_prev(&rhs_section_nodes);
+                    match syntax_result {
+                        Ok((lhs, rhs)) => {
+                            let mut change_map = ChangeMap::default();
+                            let possibly_changed =
+                                if std::env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
+                                    vec![(lhs.clone(), rhs.clone())]
+                                } else {
+                                    unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
+                                };
+                            mark_timing(&mut timing, "unchanged");
 
-                            match mark_syntax(
-                                lhs_section_nodes.first().copied(),
-                                rhs_section_nodes.first().copied(),
-                                &mut change_map,
-                                diff_options.graph_limit,
-                            ) {
-                                Ok(()) => {}
-                                Err(ExceededGraphLimit {}) => {
-                                    exceeded_graph_limit = true;
-                                    break;
+                            let mut exceeded_graph_limit = false;
+                            for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
+                                init_next_prev(&lhs_section_nodes);
+                                init_next_prev(&rhs_section_nodes);
+
+                                match mark_syntax(
+                                    lhs_section_nodes.first().copied(),
+                                    rhs_section_nodes.first().copied(),
+                                    &mut change_map,
+                                    diff_options.graph_limit,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(ExceededGraphLimit {}) => {
+                                        exceeded_graph_limit = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            mark_timing(&mut timing, "dijkstra");
+
+                            if exceeded_graph_limit {
+                                let result = TextDiffPositions {
+                                    file_format: FileFormat::TextFallback {
+                                        reason: "exceeded DFT_GRAPH_LIMIT".into(),
+                                    },
+                                    lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
+                                    rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
+                                };
+                                mark_timing(&mut timing, "line_diff");
+                                result
+                            } else {
+                                fix_all_sliders(language, &lhs, &mut change_map);
+                                fix_all_sliders(language, &rhs, &mut change_map);
+                                mark_timing(&mut timing, "sliders");
+
+                                let mut lhs_positions = syntax::change_positions(&lhs, &change_map);
+                                let mut rhs_positions = syntax::change_positions(&rhs, &change_map);
+
+                                if diff_options.ignore_comments {
+                                    let lhs_comments =
+                                        tsp::comment_positions(&lhs_tree, lhs_src, &lang_config);
+                                    lhs_positions.extend(lhs_comments);
+
+                                    let rhs_comments =
+                                        tsp::comment_positions(&rhs_tree, rhs_src, &lang_config);
+                                    rhs_positions.extend(rhs_comments);
+                                }
+                                mark_timing(&mut timing, "positions");
+
+                                TextDiffPositions {
+                                    file_format: FileFormat::SupportedLanguage(language),
+                                    lhs_positions,
+                                    rhs_positions,
                                 }
                             }
                         }
-
-                        if exceeded_graph_limit {
-                            TextDiffPositions {
+                        Err(tsp::ExceededParseErrorLimit(error_count)) => {
+                            let result = TextDiffPositions {
                                 file_format: FileFormat::TextFallback {
-                                    reason: "exceeded DFT_GRAPH_LIMIT".into(),
+                                    reason: format!(
+                                        "{} {} parse error{}, exceeded DFT_PARSE_ERROR_LIMIT",
+                                        error_count,
+                                        language_name(language),
+                                        if error_count == 1 { "" } else { "s" }
+                                    ),
                                 },
                                 lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
                                 rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
-                            }
-                        } else {
-                            fix_all_sliders(language, &lhs, &mut change_map);
-                            fix_all_sliders(language, &rhs, &mut change_map);
-
-                            let mut lhs_positions = syntax::change_positions(&lhs, &change_map);
-                            let mut rhs_positions = syntax::change_positions(&rhs, &change_map);
-
-                            if diff_options.ignore_comments {
-                                let lhs_comments =
-                                    tsp::comment_positions(&lhs_tree, lhs_src, &lang_config);
-                                lhs_positions.extend(lhs_comments);
-
-                                let rhs_comments =
-                                    tsp::comment_positions(&rhs_tree, rhs_src, &lang_config);
-                                rhs_positions.extend(rhs_comments);
-                            }
-
-                            TextDiffPositions {
-                                file_format: FileFormat::SupportedLanguage(language),
-                                lhs_positions,
-                                rhs_positions,
-                            }
+                            };
+                            mark_timing(&mut timing, "line_diff");
+                            result
                         }
                     }
-                    Err(tsp::ExceededParseErrorLimit(error_count)) => TextDiffPositions {
-                        file_format: FileFormat::TextFallback {
-                            reason: format!(
-                                "{} {} parse error{}, exceeded DFT_PARSE_ERROR_LIMIT",
-                                error_count,
-                                language_name(language),
-                                if error_count == 1 { "" } else { "s" }
-                            ),
-                        },
-                        lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
-                        rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
-                    },
-                },
+                }
                 Err(tsp::ExceededByteLimit(num_bytes)) => {
                     let format_options = FormatSizeOptions::from(BINARY).decimal_places(1);
-                    TextDiffPositions {
+                    let result = TextDiffPositions {
                         file_format: FileFormat::TextFallback {
                             reason: format!(
                                 "{} exceeded DFT_BYTE_LIMIT",
@@ -722,7 +806,9 @@ fn text_diff_positions(
                         },
                         lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
                         rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
-                    }
+                    };
+                    mark_timing(&mut timing, "line_diff");
+                    result
                 }
             }
         }
