@@ -38,6 +38,7 @@ use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
 use humansize::{format_size, FormatSizeOptions, BINARY};
+use line_numbers::LineNumber;
 use typed_arena::Arena;
 
 use crate::diff::changes::ChangeMap;
@@ -47,9 +48,10 @@ use crate::diff::unchanged;
 use crate::display::context::opposite_positions;
 use crate::display::hunks::{matched_pos_to_hunks, merge_adjacent};
 use crate::files::{guess_content, ProbableFileKind};
+use crate::hash::DftHashMap;
 use crate::lines::MaxLine;
 use crate::options::{DiffOptions, DisplayOptions, FileArgument};
-use crate::parse::guess_language::{guess, language_name, LanguageOverride};
+use crate::parse::guess_language::{guess, language_name, Language, LanguageOverride};
 use crate::parse::syntax::{self, init_next_prev};
 use crate::parse::tree_sitter_parser as tsp;
 use crate::summary::{DiffResult, FileContent, FileFormat};
@@ -160,6 +162,8 @@ pub struct DiffRequest<'a> {
     pub rhs_bytes: &'a [u8],
 }
 
+const SEMANTIC_CHUNK_MAX_DISTANCE: u32 = 4;
+
 pub fn diff_bytes_json(request: DiffRequest<'_>) -> Result<String, DifftasticError> {
     let lhs_path =
         file_argument_for_side(request.lhs_path, request.display_path, request.lhs_bytes);
@@ -192,172 +196,267 @@ pub fn diff_bytes_semantic(
     let rhs_path =
         file_argument_for_side(request.rhs_path, request.display_path, request.rhs_bytes);
     let diff_options = DiffOptions::default();
-    let display_options = DisplayOptions::default();
     let overrides = Vec::<(LanguageOverride, Vec<glob::Pattern>)>::new();
     let binary_overrides = Vec::<glob::Pattern>::new();
 
-    let diff = diff_bytes(
+    Ok(diff_bytes_semantic_impl(
         request.display_path,
         &lhs_path,
         &rhs_path,
         request.lhs_bytes,
         request.rhs_bytes,
-        &display_options,
         &diff_options,
         &overrides,
         &binary_overrides,
-    );
-    Ok(convert_to_semantic(&diff))
+    ))
 }
 
-fn convert_to_semantic(result: &DiffResult) -> SemanticDiffResult {
-    use crate::display::context::{all_matched_lines_filled, opposite_positions};
-    use crate::display::hunks::{
-        matched_lines_indexes_for_hunk, matched_pos_to_hunks, merge_adjacent,
-    };
-    use crate::display::side_by_side::lines_with_novel;
-    use crate::lines::MaxLine;
-
-    match (&result.lhs_src, &result.rhs_src) {
-        (FileContent::Binary, _) | (_, FileContent::Binary) => {
-            let status = if result.has_byte_changes.is_some() {
-                DiffStatus::Changed
-            } else {
-                DiffStatus::Binary
-            };
+fn diff_bytes_semantic_impl(
+    display_path: &str,
+    lhs_path: &FileArgument,
+    rhs_path: &FileArgument,
+    lhs_bytes: &[u8],
+    rhs_bytes: &[u8],
+    diff_options: &DiffOptions,
+    overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
+    binary_overrides: &[glob::Pattern],
+) -> SemanticDiffResult {
+    let (mut lhs_src, mut rhs_src) = match (
+        guess_content(lhs_bytes, lhs_path, binary_overrides),
+        guess_content(rhs_bytes, rhs_path, binary_overrides),
+    ) {
+        (ProbableFileKind::Binary, _) | (_, ProbableFileKind::Binary) => {
             return SemanticDiffResult {
-                status,
-                language: format!("{}", result.file_format),
+                status: DiffStatus::Binary,
+                language: FileFormat::Binary.to_string(),
                 chunks: Vec::new(),
                 aligned_lines: Vec::new(),
             };
         }
-        (FileContent::Text(lhs_src), FileContent::Text(rhs_src)) => {
-            let opposite_to_lhs = opposite_positions(&result.lhs_positions);
-            let opposite_to_rhs = opposite_positions(&result.rhs_positions);
+        (ProbableFileKind::Text(lhs_src), ProbableFileKind::Text(rhs_src)) => (lhs_src, rhs_src),
+    };
 
-            let hunks = matched_pos_to_hunks(&result.lhs_positions, &result.rhs_positions);
-            let hunks = merge_adjacent(
-                &hunks,
-                &opposite_to_lhs,
-                &opposite_to_rhs,
-                lhs_src.max_line(),
-                rhs_src.max_line(),
-                0,
-            );
+    if diff_options.strip_cr {
+        lhs_src.retain(|c| c != '\r');
+        rhs_src.retain(|c| c != '\r');
+    }
+    if !lhs_src.is_empty() && !lhs_src.ends_with('\n') {
+        lhs_src.push('\n');
+    }
+    if !rhs_src.is_empty() && !rhs_src.ends_with('\n') {
+        rhs_src.push('\n');
+    }
 
-            if hunks.is_empty() {
-                return SemanticDiffResult {
-                    status: DiffStatus::Unchanged,
-                    language: format!("{}", result.file_format),
-                    chunks: Vec::new(),
-                    aligned_lines: Vec::new(),
-                };
-            }
+    diff_file_content_semantic(
+        display_path,
+        lhs_path,
+        rhs_path,
+        &lhs_src,
+        &rhs_src,
+        diff_options,
+        overrides,
+    )
+}
 
-            if lhs_src.is_empty() {
-                return SemanticDiffResult {
-                    status: DiffStatus::Created,
-                    language: format!("{}", result.file_format),
-                    chunks: Vec::new(),
-                    aligned_lines: Vec::new(),
-                };
-            }
+fn diff_file_content_semantic(
+    display_path: &str,
+    lhs_path: &FileArgument,
+    rhs_path: &FileArgument,
+    lhs_src: &str,
+    rhs_src: &str,
+    diff_options: &DiffOptions,
+    overrides: &[(LanguageOverride, Vec<glob::Pattern>)],
+) -> SemanticDiffResult {
+    let guess_src = match rhs_path {
+        FileArgument::DevNull => lhs_src,
+        _ => rhs_src,
+    };
 
-            if rhs_src.is_empty() {
-                return SemanticDiffResult {
-                    status: DiffStatus::Deleted,
-                    language: format!("{}", result.file_format),
-                    chunks: Vec::new(),
-                    aligned_lines: Vec::new(),
-                };
-            }
+    let language = guess(Path::new(display_path), guess_src, overrides);
+    let guessed_format = file_format_for_language(language);
+    let lhs_is_dev_null = matches!(lhs_path, FileArgument::DevNull);
+    let rhs_is_dev_null = matches!(rhs_path, FileArgument::DevNull);
 
-            let lhs_lines: Vec<&str> = lhs_src.split('\n').collect();
-            let rhs_lines: Vec<&str> = rhs_src.split('\n').collect();
+    // Added/deleted files do not need tree-sitter or line-diff work to tell Diffy
+    // the file-level status. This avoids loading parser packs for file list rows
+    // whose contents are not rendered yet.
+    if lhs_is_dev_null && !rhs_is_dev_null {
+        return SemanticDiffResult {
+            status: DiffStatus::Created,
+            language: guessed_format.to_string(),
+            chunks: Vec::new(),
+            aligned_lines: Vec::new(),
+        };
+    }
+    if rhs_is_dev_null && !lhs_is_dev_null {
+        return SemanticDiffResult {
+            status: DiffStatus::Deleted,
+            language: guessed_format.to_string(),
+            chunks: Vec::new(),
+            aligned_lines: Vec::new(),
+        };
+    }
 
-            let (lhs_lines_with_novel, rhs_lines_with_novel) =
-                lines_with_novel(&result.lhs_positions, &result.rhs_positions);
+    if lhs_src == rhs_src {
+        return SemanticDiffResult {
+            status: DiffStatus::Unchanged,
+            language: guessed_format.to_string(),
+            chunks: Vec::new(),
+            aligned_lines: Vec::new(),
+        };
+    }
 
-            let matched_lines = all_matched_lines_filled(
-                &result.lhs_positions,
-                &result.rhs_positions,
-                &lhs_lines,
-                &rhs_lines,
-            );
+    let positions = text_diff_positions(lhs_src, rhs_src, diff_options, language);
+    text_positions_to_semantic(
+        &positions.file_format,
+        lhs_src,
+        rhs_src,
+        &positions.lhs_positions,
+        &positions.rhs_positions,
+    )
+}
 
-            let aligned_lines: Vec<(Option<u32>, Option<u32>)> = matched_lines
-                .iter()
-                .map(|(lhs, rhs)| (lhs.map(|l| l.0), rhs.map(|l| l.0)))
-                .collect();
+fn text_positions_to_semantic(
+    file_format: &FileFormat,
+    lhs_src: &str,
+    rhs_src: &str,
+    lhs_positions: &[syntax::MatchedPos],
+    rhs_positions: &[syntax::MatchedPos],
+) -> SemanticDiffResult {
+    use crate::display::context::all_matched_lines_filled;
+    use crate::display::side_by_side::lines_with_novel;
 
-            let mut matched_lines_slice = &matched_lines[..];
-            let mut chunks = Vec::with_capacity(hunks.len());
+    let lhs_lines: Vec<&str> = lhs_src.split('\n').collect();
+    let rhs_lines: Vec<&str> = rhs_src.split('\n').collect();
 
-            for hunk in &hunks {
-                let (start_i, end_i) = matched_lines_indexes_for_hunk(matched_lines_slice, hunk, 0);
-                let aligned = &matched_lines_slice[start_i..end_i];
-                matched_lines_slice = &matched_lines_slice[start_i..];
+    let (lhs_lines_with_novel, rhs_lines_with_novel) =
+        lines_with_novel(lhs_positions, rhs_positions);
 
-                let mut lines = Vec::new();
-                for (lhs_line_num, rhs_line_num) in aligned {
-                    let lhs_novel = lhs_line_num
-                        .map(|l| lhs_lines_with_novel.contains(&l))
-                        .unwrap_or(false);
-                    let rhs_novel = rhs_line_num
-                        .map(|l| rhs_lines_with_novel.contains(&l))
-                        .unwrap_or(false);
-                    if !lhs_novel && !rhs_novel {
-                        continue;
-                    }
+    if lhs_lines_with_novel.is_empty() && rhs_lines_with_novel.is_empty() {
+        return SemanticDiffResult {
+            status: DiffStatus::Unchanged,
+            language: file_format.to_string(),
+            chunks: Vec::new(),
+            aligned_lines: Vec::new(),
+        };
+    }
 
-                    let lhs_changes = lhs_line_num
-                        .map(|ln| semantic_changes_for_line(&result.lhs_positions, ln))
-                        .unwrap_or_default();
-                    let rhs_changes = rhs_line_num
-                        .map(|ln| semantic_changes_for_line(&result.rhs_positions, ln))
-                        .unwrap_or_default();
+    let matched_lines =
+        all_matched_lines_filled(lhs_positions, rhs_positions, &lhs_lines, &rhs_lines);
+    let aligned_lines: Vec<(Option<u32>, Option<u32>)> = matched_lines
+        .iter()
+        .map(|(lhs, rhs)| (lhs.map(|l| l.0), rhs.map(|l| l.0)))
+        .collect();
+    let lhs_changes_by_line = semantic_changes_by_line(lhs_positions);
+    let rhs_changes_by_line = semantic_changes_by_line(rhs_positions);
+    let mut chunks = Vec::new();
+    let mut current_lines = Vec::new();
+    let mut max_lhs_line: Option<LineNumber> = None;
+    let mut max_rhs_line: Option<LineNumber> = None;
 
-                    lines.push(SemanticLine {
-                        lhs_line: lhs_line_num.map(|l| l.0),
-                        rhs_line: rhs_line_num.map(|l| l.0),
-                        lhs_changes,
-                        rhs_changes,
-                    });
-                }
+    for (lhs_line_num, rhs_line_num) in matched_lines {
+        let lhs_novel = lhs_line_num
+            .map(|l| lhs_lines_with_novel.contains(&l))
+            .unwrap_or(false);
+        let rhs_novel = rhs_line_num
+            .map(|l| rhs_lines_with_novel.contains(&l))
+            .unwrap_or(false);
+        if !lhs_novel && !rhs_novel {
+            continue;
+        }
 
-                if !lines.is_empty() {
-                    chunks.push(SemanticChunk { lines });
-                }
-            }
+        if !current_lines.is_empty()
+            && !semantic_lines_are_close(max_lhs_line, max_rhs_line, lhs_line_num, rhs_line_num)
+        {
+            chunks.push(SemanticChunk {
+                lines: std::mem::take(&mut current_lines),
+            });
+        }
 
-            SemanticDiffResult {
-                status: DiffStatus::Changed,
-                language: format!("{}", result.file_format),
-                chunks,
-                aligned_lines,
-            }
+        current_lines.push(SemanticLine {
+            lhs_line: lhs_line_num.map(|l| l.0),
+            rhs_line: rhs_line_num.map(|l| l.0),
+            lhs_changes: lhs_line_num
+                .and_then(|ln| lhs_changes_by_line.get(&ln).cloned())
+                .unwrap_or_default(),
+            rhs_changes: rhs_line_num
+                .and_then(|ln| rhs_changes_by_line.get(&ln).cloned())
+                .unwrap_or_default(),
+        });
+
+        if let Some(lhs_line_num) = lhs_line_num {
+            max_lhs_line = Some(lhs_line_num);
+        }
+        if let Some(rhs_line_num) = rhs_line_num {
+            max_rhs_line = Some(rhs_line_num);
+        }
+    }
+
+    if !current_lines.is_empty() {
+        chunks.push(SemanticChunk {
+            lines: current_lines,
+        });
+    }
+
+    if chunks.is_empty() {
+        SemanticDiffResult {
+            status: DiffStatus::Unchanged,
+            language: file_format.to_string(),
+            chunks,
+            aligned_lines: Vec::new(),
+        }
+    } else {
+        SemanticDiffResult {
+            status: DiffStatus::Changed,
+            language: file_format.to_string(),
+            chunks,
+            aligned_lines,
         }
     }
 }
 
-fn semantic_changes_for_line(
+fn semantic_lines_are_close(
+    max_lhs: Option<LineNumber>,
+    max_rhs: Option<LineNumber>,
+    lhs: Option<LineNumber>,
+    rhs: Option<LineNumber>,
+) -> bool {
+    if let (Some(max_lhs), Some(lhs)) = (max_lhs, lhs) {
+        if lhs.0 <= max_lhs.0 + SEMANTIC_CHUNK_MAX_DISTANCE {
+            return true;
+        }
+    }
+    if let (Some(max_rhs), Some(rhs)) = (max_rhs, rhs) {
+        if rhs.0 <= max_rhs.0 + SEMANTIC_CHUNK_MAX_DISTANCE {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn semantic_changes_by_line(
     positions: &[syntax::MatchedPos],
-    line_num: line_numbers::LineNumber,
-) -> Vec<ChangeSpan> {
-    positions
-        .iter()
-        .filter(|m| m.pos.line == line_num && m.kind.is_novel())
-        .map(|m| {
-            let (highlight, intensity) = convert_match_kind(&m.kind);
-            ChangeSpan {
-                start_col: m.pos.start_col,
-                end_col: m.pos.end_col,
+) -> DftHashMap<LineNumber, Vec<ChangeSpan>> {
+    let mut by_line: DftHashMap<LineNumber, Vec<ChangeSpan>> = DftHashMap::default();
+    for matched in positions.iter().filter(|matched| matched.kind.is_novel()) {
+        let (highlight, intensity) = convert_match_kind(&matched.kind);
+        by_line
+            .entry(matched.pos.line)
+            .or_default()
+            .push(ChangeSpan {
+                start_col: matched.pos.start_col,
+                end_col: matched.pos.end_col,
                 highlight,
                 intensity,
-            }
-        })
-        .collect()
+            });
+    }
+
+    for spans in by_line.values_mut() {
+        spans.sort_unstable_by_key(|span| (span.start_col, span.end_col));
+    }
+
+    by_line
 }
 
 fn convert_match_kind(kind: &syntax::MatchKind) -> (HighlightKind, ChangeIntensity) {
@@ -492,6 +591,141 @@ fn check_only_text(
         hunks: vec![],
         has_byte_changes,
         has_syntactic_changes: lhs_src != rhs_src,
+    }
+}
+
+fn file_format_for_language(language: Option<Language>) -> FileFormat {
+    match language {
+        Some(language) => FileFormat::SupportedLanguage(language),
+        None => FileFormat::PlainText,
+    }
+}
+
+struct TextDiffPositions {
+    file_format: FileFormat,
+    lhs_positions: Vec<syntax::MatchedPos>,
+    rhs_positions: Vec<syntax::MatchedPos>,
+}
+
+fn text_diff_positions(
+    lhs_src: &str,
+    rhs_src: &str,
+    diff_options: &DiffOptions,
+    language: Option<Language>,
+) -> TextDiffPositions {
+    let lang_config = language.and_then(|language| match tsp::from_language(language) {
+        Ok(config) => Some((language, config)),
+        Err(error) => {
+            info!("Falling back to line diff: {error}");
+            None
+        }
+    });
+
+    match lang_config {
+        None => TextDiffPositions {
+            file_format: FileFormat::PlainText,
+            lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
+            rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
+        },
+        Some((language, lang_config)) => {
+            let arena = Arena::new();
+            match tsp::to_tree_with_limit(diff_options, &lang_config, lhs_src, rhs_src) {
+                Ok((lhs_tree, rhs_tree)) => match tsp::to_syntax_with_limit(
+                    lhs_src,
+                    rhs_src,
+                    &lhs_tree,
+                    &rhs_tree,
+                    &arena,
+                    &lang_config,
+                    diff_options,
+                ) {
+                    Ok((lhs, rhs)) => {
+                        let mut change_map = ChangeMap::default();
+                        let possibly_changed = if std::env::var("DFT_DBG_KEEP_UNCHANGED").is_ok() {
+                            vec![(lhs.clone(), rhs.clone())]
+                        } else {
+                            unchanged::mark_unchanged(&lhs, &rhs, &mut change_map)
+                        };
+
+                        let mut exceeded_graph_limit = false;
+                        for (lhs_section_nodes, rhs_section_nodes) in possibly_changed {
+                            init_next_prev(&lhs_section_nodes);
+                            init_next_prev(&rhs_section_nodes);
+
+                            match mark_syntax(
+                                lhs_section_nodes.first().copied(),
+                                rhs_section_nodes.first().copied(),
+                                &mut change_map,
+                                diff_options.graph_limit,
+                            ) {
+                                Ok(()) => {}
+                                Err(ExceededGraphLimit {}) => {
+                                    exceeded_graph_limit = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if exceeded_graph_limit {
+                            TextDiffPositions {
+                                file_format: FileFormat::TextFallback {
+                                    reason: "exceeded DFT_GRAPH_LIMIT".into(),
+                                },
+                                lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
+                                rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
+                            }
+                        } else {
+                            fix_all_sliders(language, &lhs, &mut change_map);
+                            fix_all_sliders(language, &rhs, &mut change_map);
+
+                            let mut lhs_positions = syntax::change_positions(&lhs, &change_map);
+                            let mut rhs_positions = syntax::change_positions(&rhs, &change_map);
+
+                            if diff_options.ignore_comments {
+                                let lhs_comments =
+                                    tsp::comment_positions(&lhs_tree, lhs_src, &lang_config);
+                                lhs_positions.extend(lhs_comments);
+
+                                let rhs_comments =
+                                    tsp::comment_positions(&rhs_tree, rhs_src, &lang_config);
+                                rhs_positions.extend(rhs_comments);
+                            }
+
+                            TextDiffPositions {
+                                file_format: FileFormat::SupportedLanguage(language),
+                                lhs_positions,
+                                rhs_positions,
+                            }
+                        }
+                    }
+                    Err(tsp::ExceededParseErrorLimit(error_count)) => TextDiffPositions {
+                        file_format: FileFormat::TextFallback {
+                            reason: format!(
+                                "{} {} parse error{}, exceeded DFT_PARSE_ERROR_LIMIT",
+                                error_count,
+                                language_name(language),
+                                if error_count == 1 { "" } else { "s" }
+                            ),
+                        },
+                        lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
+                        rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
+                    },
+                },
+                Err(tsp::ExceededByteLimit(num_bytes)) => {
+                    let format_options = FormatSizeOptions::from(BINARY).decimal_places(1);
+                    TextDiffPositions {
+                        file_format: FileFormat::TextFallback {
+                            reason: format!(
+                                "{} exceeded DFT_BYTE_LIMIT",
+                                &format_size(num_bytes, format_options)
+                            ),
+                        },
+                        lhs_positions: line_parser::change_positions(lhs_src, rhs_src),
+                        rhs_positions: line_parser::change_positions(rhs_src, lhs_src),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -717,5 +951,48 @@ fn diff_file_content(
         hunks,
         has_byte_changes,
         has_syntactic_changes,
+    }
+}
+#[cfg(test)]
+mod semantic_tests {
+    use super::{diff_bytes_semantic, DiffRequest, DiffStatus};
+
+    #[test]
+    fn semantic_diff_uses_paths_for_created_and_deleted_empty_files() {
+        let created = diff_bytes_semantic(DiffRequest {
+            display_path: "empty.txt",
+            lhs_path: None,
+            rhs_path: Some(std::path::Path::new("empty.txt")),
+            lhs_bytes: b"",
+            rhs_bytes: b"",
+        })
+        .unwrap();
+        assert_eq!(created.status, DiffStatus::Created);
+
+        let deleted = diff_bytes_semantic(DiffRequest {
+            display_path: "empty.txt",
+            lhs_path: Some(std::path::Path::new("empty.txt")),
+            rhs_path: None,
+            lhs_bytes: b"",
+            rhs_bytes: b"",
+        })
+        .unwrap();
+        assert_eq!(deleted.status, DiffStatus::Deleted);
+    }
+
+    #[test]
+    fn semantic_diff_returns_changed_chunks_without_display_diff_result() {
+        let result = diff_bytes_semantic(DiffRequest {
+            display_path: "notes.txt",
+            lhs_path: Some(std::path::Path::new("notes.txt")),
+            rhs_path: Some(std::path::Path::new("notes.txt")),
+            lhs_bytes: b"one\ntwo\n",
+            rhs_bytes: b"one\nthree\n",
+        })
+        .unwrap();
+
+        assert_eq!(result.status, DiffStatus::Changed);
+        assert_eq!(result.chunks.len(), 1);
+        assert!(!result.aligned_lines.is_empty());
     }
 }
