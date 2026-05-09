@@ -59,6 +59,55 @@ mod words;
 #[macro_use]
 extern crate log;
 
+use std::fmt::{Display, Formatter};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DifftasticError(String);
+
+#[allow(dead_code)]
+impl DifftasticError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl Display for DifftasticError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DifftasticError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightKind {
+    Normal,
+    Keyword,
+    String,
+    Comment,
+    Number,
+    Type,
+    Function,
+    Operator,
+    Punctuation,
+    Variable,
+    Constant,
+    Builtin,
+    Attribute,
+    Tag,
+    Property,
+    Namespace,
+    Label,
+    Preprocessor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightSpan {
+    pub offset: u32,
+    pub length: u32,
+    pub kind: HighlightKind,
+}
+
 use display::style::print_warning;
 use log::info;
 use options::{FilePermissions, USAGE};
@@ -96,10 +145,16 @@ use crate::parse::syntax;
 ///
 /// For reference, Jemalloc uses 10-20% more time (although up to 33%
 /// more instructions) when testing on sample files.
-#[cfg(not(any(windows, target_os = "illumos", target_os = "freebsd")))]
+#[cfg(all(
+    feature = "jemalloc",
+    not(any(windows, target_os = "illumos", target_os = "freebsd"))
+))]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(not(any(windows, target_os = "illumos", target_os = "freebsd")))]
+#[cfg(all(
+    feature = "jemalloc",
+    not(any(windows, target_os = "illumos", target_os = "freebsd"))
+))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -153,11 +208,15 @@ fn main() {
 
             let language = guess(path, &src, &language_overrides);
             match language {
-                Some(lang) => {
-                    let ts_lang = tsp::from_language(lang);
-                    let tree = tsp::to_tree(&src, &ts_lang);
-                    tsp::print_tree(&src, &tree);
-                }
+                Some(lang) => match tsp::from_language(lang) {
+                    Ok(ts_lang) => {
+                        let tree = tsp::to_tree(&src, &ts_lang);
+                        tsp::print_tree(&src, &tree);
+                    }
+                    Err(error) => {
+                        eprintln!("No tree-sitter parser for file: {path:?} ({error})");
+                    }
+                },
                 None => {
                     eprintln!("No tree-sitter parser for file: {:?}", path);
                 }
@@ -174,13 +233,17 @@ fn main() {
 
             let language = guess(path, &src, &language_overrides);
             match language {
-                Some(lang) => {
-                    let ts_lang = tsp::from_language(lang);
-                    let arena = Arena::new();
-                    let ast = tsp::parse(&arena, &src, &ts_lang, ignore_comments);
-                    init_all_info(&ast, &[]);
-                    println!("{:#?}", ast);
-                }
+                Some(lang) => match tsp::from_language(lang) {
+                    Ok(ts_lang) => {
+                        let arena = Arena::new();
+                        let ast = tsp::parse(&arena, &src, &ts_lang, ignore_comments);
+                        init_all_info(&ast, &[]);
+                        println!("{:#?}", ast);
+                    }
+                    Err(error) => {
+                        eprintln!("No tree-sitter parser for file: {path:?} ({error})");
+                    }
+                },
                 None => {
                     eprintln!("No tree-sitter parser for file: {:?}", path);
                 }
@@ -197,13 +260,17 @@ fn main() {
 
             let language = guess(path, &src, &language_overrides);
             match language {
-                Some(lang) => {
-                    let ts_lang = tsp::from_language(lang);
-                    let arena = Arena::new();
-                    let ast = tsp::parse(&arena, &src, &ts_lang, ignore_comments);
-                    init_all_info(&ast, &[]);
-                    syntax::print_as_dot(&ast);
-                }
+                Some(lang) => match tsp::from_language(lang) {
+                    Ok(ts_lang) => {
+                        let arena = Arena::new();
+                        let ast = tsp::parse(&arena, &src, &ts_lang, ignore_comments);
+                        init_all_info(&ast, &[]);
+                        syntax::print_as_dot(&ast);
+                    }
+                    Err(error) => {
+                        eprintln!("No tree-sitter parser for file: {path:?} ({error})");
+                    }
+                },
                 None => {
                     eprintln!("No tree-sitter parser for file: {:?}", path);
                 }
@@ -610,7 +677,6 @@ fn diff_file_content(
     };
 
     let language = guess(Path::new(display_path), guess_src, overrides);
-    let lang_config = language.map(|lang| (lang, tsp::from_language(lang)));
 
     if lhs_src == rhs_src {
         let file_format = match language {
@@ -633,6 +699,14 @@ fn diff_file_content(
             has_syntactic_changes: false,
         };
     }
+
+    let lang_config = language.and_then(|language| match tsp::from_language(language) {
+        Ok(config) => Some((language, config)),
+        Err(error) => {
+            info!("Falling back to line diff: {error}");
+            None
+        }
+    });
 
     let (file_format, lhs_positions, rhs_positions) = match lang_config {
         None => {

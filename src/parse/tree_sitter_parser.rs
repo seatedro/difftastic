@@ -68,6 +68,7 @@ pub(crate) struct TreeSitterConfig {
     sub_languages: Vec<TreeSitterSubLanguage>,
 }
 
+#[cfg(feature = "static-languages")]
 extern "C" {
     fn tree_sitter_commonlisp() -> ts::Language;
     fn tree_sitter_elvish() -> ts::Language;
@@ -82,6 +83,7 @@ extern "C" {
 }
 
 // TODO: begin/end and object/end.
+#[cfg(feature = "static-languages")]
 const OCAML_ATOM_NODES: [&str; 6] = [
     "character",
     "string",
@@ -91,9 +93,16 @@ const OCAML_ATOM_NODES: [&str; 6] = [
     "attribute_id",
 ];
 
-pub(crate) fn from_language(language: guess::Language) -> TreeSitterConfig {
+pub(crate) fn from_language(
+    language: guess::Language,
+) -> Result<TreeSitterConfig, DifftasticError> {
+    from_language_impl(language)
+}
+
+#[cfg(feature = "static-languages")]
+fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, DifftasticError> {
     use guess::Language::*;
-    match language {
+    Ok(match language {
         Ada => {
             let language_fn = tree_sitter_ada::LANGUAGE;
             let language = tree_sitter::Language::new(language_fn);
@@ -1182,9 +1191,314 @@ pub(crate) fn from_language(language: guess::Language) -> TreeSitterConfig {
                 sub_languages: vec![],
             }
         }
+    })
+}
+
+#[cfg(all(not(feature = "static-languages"), feature = "dynamic-languages"))]
+fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, DifftasticError> {
+    dynamic::from_language(language)
+}
+
+#[cfg(not(any(feature = "static-languages", feature = "dynamic-languages")))]
+fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, DifftasticError> {
+    Err(DifftasticError::new(format!(
+        "no tree-sitter language provider compiled for {:?}",
+        language
+    )))
+}
+
+#[cfg(all(not(feature = "static-languages"), feature = "dynamic-languages"))]
+mod dynamic {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Component, Path, PathBuf};
+    use std::rc::Rc;
+
+    use serde::Deserialize;
+    use tree_sitter as ts;
+    use tree_sitter_language::LanguageFn;
+
+    use super::{guess, TreeSitterConfig};
+    use crate::DifftasticError;
+
+    const DYNAMIC_LANGUAGE_DIR_ENV: &str = "DFT_DYNAMIC_LANGUAGE_DIR";
+
+    #[derive(Debug, Deserialize)]
+    struct PackManifest {
+        platform: String,
+        tree_sitter_abi: u32,
+        symbol: String,
+        parser: PackFile,
+        highlights: PackFile,
+        injections: Option<PackFile>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PackFile {
+        path: String,
+    }
+
+    thread_local! {
+        static LIBRARIES: RefCell<HashMap<PathBuf, Rc<libloading::Library>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn from_language(
+        language: guess::Language,
+    ) -> Result<TreeSitterConfig, DifftasticError> {
+        let pack_language = pack_language_name(language).ok_or_else(|| {
+            DifftasticError::new(format!(
+                "dynamic parser pack unavailable for {:?}",
+                language
+            ))
+        })?;
+        let (tree_sitter_language, query_source) = load_pack(pack_language)?;
+        tree_sitter_config(language, tree_sitter_language, &query_source)
+    }
+
+    fn pack_language_name(language: guess::Language) -> Option<&'static str> {
+        use guess::Language::*;
+        match language {
+            Bash => Some("bash"),
+            C => Some("c"),
+            CPlusPlus => Some("cpp"),
+            Go => Some("go"),
+            JavaScript | JavascriptJsx => Some("javascript"),
+            Json => Some("json"),
+            Nix => Some("nix"),
+            Python => Some("python"),
+            Rust => Some("rust"),
+            Toml => Some("toml"),
+            TypeScript => Some("typescript"),
+            TypeScriptTsx => Some("tsx"),
+            Zig => Some("zig"),
+            _ => None,
+        }
+    }
+
+    fn tree_sitter_config(
+        language: guess::Language,
+        tree_sitter_language: ts::Language,
+        query_source: &str,
+    ) -> Result<TreeSitterConfig, DifftasticError> {
+        use guess::Language::*;
+        let (atom_nodes, delimiter_tokens): (Vec<&'static str>, Vec<(&'static str, &'static str)>) =
+            match language {
+                Bash => (
+                    vec!["string", "raw_string", "heredoc_body", "simple_expansion"],
+                    vec![("(", ")"), ("{", "}"), ("[", "]")],
+                ),
+                C => (
+                    vec!["string_literal", "char_literal"],
+                    vec![("(", ")"), ("{", "}"), ("[", "]")],
+                ),
+                CPlusPlus => (
+                    vec!["string_literal", "char_literal"],
+                    vec![("(", ")"), ("{", "}"), ("[", "]"), ("<", ">")],
+                ),
+                Go => (
+                    vec!["interpreted_string_literal", "raw_string_literal"],
+                    vec![("{", "}"), ("[", "]"), ("(", ")")],
+                ),
+                JavaScript | JavascriptJsx => (
+                    vec!["string", "template_string", "regex"],
+                    vec![("[", "]"), ("(", ")"), ("{", "}"), ("<", ">")],
+                ),
+                Json => (vec!["string"], vec![("{", "}"), ("[", "]")]),
+                Nix => (
+                    vec!["string_expression", "indented_string_expression"],
+                    vec![("{", "}"), ("[", "]")],
+                ),
+                Python => (vec!["string"], vec![("(", ")"), ("[", "]"), ("{", "}")]),
+                Rust => (
+                    vec!["char_literal", "string_literal", "raw_string_literal"],
+                    vec![("{", "}"), ("(", ")"), ("[", "]"), ("|", "|"), ("<", ">")],
+                ),
+                Toml => (vec!["string", "quoted_key"], vec![("{", "}"), ("[", "]")]),
+                TypeScriptTsx => (
+                    vec!["string", "template_string"],
+                    vec![("{", "}"), ("(", ")"), ("[", "]"), ("<", ">")],
+                ),
+                TypeScript => (
+                    vec!["string", "template_string", "regex", "predefined_type"],
+                    vec![("{", "}"), ("(", ")"), ("[", "]"), ("<", ">")],
+                ),
+                Zig => (vec!["string"], vec![("{", "}"), ("[", "]"), ("(", ")")]),
+                _ => {
+                    return Err(DifftasticError::new(format!(
+                        "dynamic parser pack unavailable for {:?}",
+                        language
+                    )));
+                }
+            };
+
+        let highlight_query = ts::Query::new(&tree_sitter_language, query_source)
+            .map_err(|error| DifftasticError::new(error.to_string()))?;
+        Ok(TreeSitterConfig {
+            language: tree_sitter_language,
+            atom_nodes: atom_nodes.into_iter().collect(),
+            delimiter_tokens,
+            highlight_query,
+            sub_languages: vec![],
+        })
+    }
+
+    fn load_pack(language: &str) -> Result<(ts::Language, String), DifftasticError> {
+        let storage_dir = dynamic_storage_dir()?;
+        let (pack_dir, manifest) = latest_manifest(&storage_dir, language)?;
+        validate_manifest(&manifest)?;
+        let parser_path = safe_join(&pack_dir, &manifest.parser.path)?;
+        let highlight_path = safe_join(&pack_dir, &manifest.highlights.path)?;
+        let library = load_library(parser_path)?;
+        type LanguageSymbol = unsafe extern "C" fn() -> *const ();
+        let language_fn = unsafe {
+            let symbol: libloading::Symbol<'_, LanguageSymbol> = library
+                .get(manifest.symbol.as_bytes())
+                .map_err(|error| DifftasticError::new(error.to_string()))?;
+            LanguageFn::from_raw(*symbol)
+        };
+        let mut query_source = fs::read_to_string(highlight_path)
+            .map_err(|error| DifftasticError::new(error.to_string()))?;
+        if let Some(injections) = &manifest.injections {
+            let injections_path = safe_join(&pack_dir, &injections.path)?;
+            query_source.push_str(
+                &fs::read_to_string(injections_path)
+                    .map_err(|error| DifftasticError::new(error.to_string()))?,
+            );
+        }
+        Ok((ts::Language::new(language_fn), query_source))
+    }
+
+    fn dynamic_storage_dir() -> Result<PathBuf, DifftasticError> {
+        if let Some(path) = std::env::var_os(DYNAMIC_LANGUAGE_DIR_ENV) {
+            return Ok(PathBuf::from(path));
+        }
+        dirs::data_local_dir()
+            .map(|base| base.join("diffy").join("phosphor").join("languages"))
+            .ok_or_else(|| {
+                DifftasticError::new("dynamic parser pack storage directory is unavailable")
+            })
+    }
+
+    fn latest_manifest(
+        storage_dir: &Path,
+        language: &str,
+    ) -> Result<(PathBuf, PackManifest), DifftasticError> {
+        let language_dir = storage_dir.join(language);
+        let entries = fs::read_dir(&language_dir).map_err(|error| {
+            DifftasticError::new(format!(
+                "dynamic parser pack for {language} is unavailable at {}: {error}",
+                language_dir.display()
+            ))
+        })?;
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| DifftasticError::new(error.to_string()))?;
+            if !entry
+                .file_type()
+                .map_err(|error| DifftasticError::new(error.to_string()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let pack_dir = entry.path().join(platform_triple());
+            let manifest_path = pack_dir.join("manifest.json");
+            if manifest_path.exists() {
+                candidates.push((entry.file_name(), pack_dir, manifest_path));
+            }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        let Some((_, pack_dir, manifest_path)) = candidates.pop() else {
+            return Err(DifftasticError::new(format!(
+                "dynamic parser pack for {language} has no {} manifest",
+                platform_triple()
+            )));
+        };
+        let manifest_bytes =
+            fs::read(manifest_path).map_err(|error| DifftasticError::new(error.to_string()))?;
+        let manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| DifftasticError::new(error.to_string()))?;
+        Ok((pack_dir, manifest))
+    }
+
+    fn validate_manifest(manifest: &PackManifest) -> Result<(), DifftasticError> {
+        if manifest.platform != platform_triple() {
+            return Err(DifftasticError::new(format!(
+                "dynamic parser pack is for {}, expected {}",
+                manifest.platform,
+                platform_triple()
+            )));
+        }
+        let expected_abi = u32::try_from(tree_sitter::LANGUAGE_VERSION).unwrap_or(u32::MAX);
+        if manifest.tree_sitter_abi != expected_abi {
+            return Err(DifftasticError::new(format!(
+                "dynamic parser pack tree-sitter ABI is {}, expected {}",
+                manifest.tree_sitter_abi, expected_abi
+            )));
+        }
+        Ok(())
+    }
+
+    fn safe_join(base: &Path, path: &str) -> Result<PathBuf, DifftasticError> {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(DifftasticError::new(format!(
+                "dynamic parser pack path is unsafe: {path}"
+            )));
+        }
+        Ok(base.join(relative))
+    }
+
+    fn load_library(path: PathBuf) -> Result<Rc<libloading::Library>, DifftasticError> {
+        LIBRARIES.with(|libraries| {
+            let mut libraries = libraries.borrow_mut();
+            if let Some(library) = libraries.get(&path) {
+                return Ok(Rc::clone(library));
+            }
+            let library = Rc::new(
+                unsafe { libloading::Library::new(&path) }
+                    .map_err(|error| DifftasticError::new(error.to_string()))?,
+            );
+            libraries.insert(path, Rc::clone(&library));
+            Ok(library)
+        })
+    }
+
+    fn platform_triple() -> &'static str {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            "windows-x86_64"
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            "macos-aarch64"
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            "macos-x86_64"
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            "linux-x86_64"
+        }
+        #[cfg(not(any(
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        )))]
+        {
+            "unknown"
+        }
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn highlight_ranges(
     source: &str,
     language: guess::Language,
@@ -1193,7 +1507,7 @@ pub(crate) fn highlight_ranges(
         return Ok(Vec::new());
     }
 
-    let config = from_language(language);
+    let config = from_language(language)?;
     let mut parser = ts::Parser::new();
     parser
         .set_language(&config.language)
@@ -1249,6 +1563,7 @@ pub(crate) fn highlight_ranges(
     Ok(result)
 }
 
+#[allow(dead_code)]
 fn capture_name_to_highlight_kind(name: &str) -> HighlightKind {
     if name.starts_with("keyword") {
         HighlightKind::Keyword
@@ -1337,7 +1652,9 @@ pub(crate) fn parse_subtrees(
                 continue;
             }
 
-            let subconfig = from_language(language.parse_as);
+            let Ok(subconfig) = from_language(language.parse_as) else {
+                continue;
+            };
             let mut parser = ts::Parser::new();
             parser
                 .set_language(&subconfig.language)
@@ -1976,14 +2293,14 @@ mod tests {
     #[test]
     fn test_parse() {
         let arena = Arena::new();
-        let css_config = from_language(guess::Language::Css);
+        let css_config = from_language(guess::Language::Css).unwrap();
         parse(&arena, ".foo {}", &css_config, false);
     }
 
     #[test]
     fn test_parse_empty_file() {
         let arena = Arena::new();
-        let config = from_language(guess::Language::EmacsLisp);
+        let config = from_language(guess::Language::EmacsLisp).unwrap();
         let res = parse(&arena, "", &config, false);
 
         let expected: Vec<&Syntax> = vec![];
@@ -1995,7 +2312,7 @@ mod tests {
     #[test]
     fn test_subtrees() {
         let arena = Arena::new();
-        let config = from_language(guess::Language::Html);
+        let config = from_language(guess::Language::Html).unwrap();
         let res = parse(&arena, "<style>.a { color: red; }</style>", &config, false);
 
         match res[0] {
@@ -2018,7 +2335,7 @@ mod tests {
     #[test]
     fn test_configs_valid() {
         for language in guess::Language::iter() {
-            from_language(language);
+            from_language(language).unwrap();
         }
     }
 }

@@ -9,15 +9,18 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(feature = "static-languages")]
 use rayon::prelude::*;
 use version_check as rustc;
 
+#[cfg(feature = "static-languages")]
 struct TreeSitterParser {
     name: &'static str,
     src_dir: &'static str,
     extra_files: Vec<&'static str>,
 }
 
+#[cfg(feature = "static-languages")]
 impl TreeSitterParser {
     fn build(&self) {
         let dir = PathBuf::from(&self.src_dir);
@@ -67,6 +70,7 @@ impl TreeSitterParser {
 }
 
 fn main() {
+    #[cfg(feature = "static-languages")]
     let parsers = vec![
         TreeSitterParser {
             name: "tree-sitter-commonlisp",
@@ -120,12 +124,16 @@ fn main() {
         },
     ];
 
-    // Only rerun if relevant files in the vendored_parsers/ directory change.
-    for parser in &parsers {
-        println!("cargo:rerun-if-changed={}", parser.src_dir);
+    #[cfg(feature = "static-languages")]
+    {
+        // Only rerun if relevant files in the vendored_parsers/ directory change.
+        for parser in &parsers {
+            println!("cargo:rerun-if-changed={}", parser.src_dir);
+        }
+
+        parsers.par_iter().for_each(|p| p.build());
     }
 
-    parsers.par_iter().for_each(|p| p.build());
     commit_info();
 
     if let Some((version, _, _)) = rustc::triple() {

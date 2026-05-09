@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn test_slider_two_steps() {
         let arena = Arena::new();
-        let config = from_language(guess_language::Language::EmacsLisp);
+        let config = from_language(guess_language::Language::EmacsLisp).unwrap();
 
         let lhs = parse(&arena, "A B", &config, false);
         let rhs = parse(&arena, "A B X\n A B", &config, false);
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn test_slider_partially_unchanged() {
         let arena = Arena::new();
-        let config = from_language(guess_language::Language::EmacsLisp);
+        let config = from_language(guess_language::Language::EmacsLisp).unwrap();
 
         let lhs = parse(&arena, "(A B) X \n (A B)", &config, false);
         let rhs = parse(&arena, "((novel) A B)", &config, false);

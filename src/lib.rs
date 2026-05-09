@@ -511,7 +511,6 @@ fn diff_file_content(
     };
 
     let language = guess(Path::new(display_path), guess_src, overrides);
-    let lang_config = language.map(|language| (language, tsp::from_language(language)));
 
     if lhs_src == rhs_src {
         let file_format = match language {
@@ -532,6 +531,14 @@ fn diff_file_content(
             has_syntactic_changes: false,
         };
     }
+
+    let lang_config = language.and_then(|language| match tsp::from_language(language) {
+        Ok(config) => Some((language, config)),
+        Err(error) => {
+            info!("Falling back to line diff: {error}");
+            None
+        }
+    });
 
     let (file_format, lhs_positions, rhs_positions) = match lang_config {
         None => {
