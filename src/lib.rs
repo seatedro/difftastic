@@ -150,6 +150,7 @@ pub enum DiffStatus {
 pub struct SemanticDiffResult {
     pub status: DiffStatus,
     pub language: String,
+    pub line_fallback_reason: Option<String>,
     pub chunks: Vec<SemanticChunk>,
     pub aligned_lines: Vec<(Option<u32>, Option<u32>)>,
 }
@@ -288,6 +289,7 @@ fn diff_bytes_semantic_impl(
             return SemanticDiffResult {
                 status: DiffStatus::Binary,
                 language: FileFormat::Binary.to_string(),
+                line_fallback_reason: None,
                 chunks: Vec::new(),
                 aligned_lines: Vec::new(),
             };
@@ -350,6 +352,7 @@ fn diff_file_content_semantic(
         return SemanticDiffResult {
             status: DiffStatus::Created,
             language: guessed_format.to_string(),
+            line_fallback_reason: None,
             chunks: Vec::new(),
             aligned_lines: Vec::new(),
         };
@@ -361,6 +364,7 @@ fn diff_file_content_semantic(
         return SemanticDiffResult {
             status: DiffStatus::Deleted,
             language: guessed_format.to_string(),
+            line_fallback_reason: None,
             chunks: Vec::new(),
             aligned_lines: Vec::new(),
         };
@@ -373,6 +377,7 @@ fn diff_file_content_semantic(
         return SemanticDiffResult {
             status: DiffStatus::Unchanged,
             language: guessed_format.to_string(),
+            line_fallback_reason: None,
             chunks: Vec::new(),
             aligned_lines: Vec::new(),
         };
@@ -390,6 +395,13 @@ fn diff_file_content_semantic(
         timing.mark("semantic_convert");
     }
     result
+}
+
+fn line_fallback_reason(file_format: &FileFormat) -> Option<String> {
+    match file_format {
+        FileFormat::TextFallback { reason } => Some(reason.clone()),
+        FileFormat::SupportedLanguage(_) | FileFormat::PlainText | FileFormat::Binary => None,
+    }
 }
 
 fn text_positions_to_semantic(
@@ -412,6 +424,7 @@ fn text_positions_to_semantic(
         return SemanticDiffResult {
             status: DiffStatus::Unchanged,
             language: file_format.to_string(),
+            line_fallback_reason: line_fallback_reason(file_format),
             chunks: Vec::new(),
             aligned_lines: Vec::new(),
         };
@@ -478,6 +491,7 @@ fn text_positions_to_semantic(
         SemanticDiffResult {
             status: DiffStatus::Unchanged,
             language: file_format.to_string(),
+            line_fallback_reason: line_fallback_reason(file_format),
             chunks,
             aligned_lines: Vec::new(),
         }
@@ -485,6 +499,7 @@ fn text_positions_to_semantic(
         SemanticDiffResult {
             status: DiffStatus::Changed,
             language: file_format.to_string(),
+            line_fallback_reason: line_fallback_reason(file_format),
             chunks,
             aligned_lines,
         }
