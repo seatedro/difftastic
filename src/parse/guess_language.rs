@@ -195,8 +195,8 @@ use Language::*;
 use crate::lines::split_on_newlines;
 
 /// File globs that identify languages based on the file path.
-pub(crate) fn language_globs(language: Language) -> Vec<glob::Pattern> {
-    let glob_strs: &'static [&'static str] = match language {
+fn language_glob_strs(language: Language) -> &'static [&'static str] {
+    match language {
         Ada => &["*.ada", "*.adb", "*.ads"],
         Bash => &[
             "*.bash",
@@ -420,14 +420,22 @@ pub(crate) fn language_globs(language: Language) -> Vec<glob::Pattern> {
         ],
         Yaml => &["*.yaml", "*.yml", "yarn.lock", "CITATION.cff"],
         Zig => &["*.zig"],
-    };
+    }
+}
 
-    glob_strs
+pub(crate) fn language_globs(language: Language) -> Vec<glob::Pattern> {
+    language_glob_strs(language)
         .iter()
         .map(|name| {
             glob::Pattern::new(name).expect("Glob in difftastic source should be well-formed")
         })
         .collect()
+}
+
+lazy_static! {
+    static ref ALL_LANGUAGE_GLOBS: Vec<(Language, Vec<glob::Pattern>)> = Language::iter()
+        .map(|language| (language, language_globs(language)))
+        .collect();
 }
 
 fn looks_like_hacklang(path: &Path, src: &str) -> bool {
@@ -626,11 +634,11 @@ fn from_shebang(src: &str) -> Option<Language> {
 fn from_glob(path: &Path) -> Option<Language> {
     match path.file_name() {
         Some(name) => {
-            let name = name.to_string_lossy().into_owned();
-            for language in Language::iter() {
-                for glob in language_globs(language) {
+            let name = name.to_string_lossy();
+            for (language, globs) in ALL_LANGUAGE_GLOBS.iter() {
+                for glob in globs {
                     if glob.matches(&name) {
-                        return Some(language);
+                        return Some(*language);
                     }
                 }
             }
