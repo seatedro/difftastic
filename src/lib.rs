@@ -407,8 +407,8 @@ fn text_positions_to_semantic(
         .iter()
         .map(|(lhs, rhs)| (lhs.map(|l| l.0), rhs.map(|l| l.0)))
         .collect();
-    let lhs_changes_by_line = semantic_changes_by_line(lhs_positions);
-    let rhs_changes_by_line = semantic_changes_by_line(rhs_positions);
+    let mut lhs_changes_by_line = semantic_changes_by_line(lhs_positions);
+    let mut rhs_changes_by_line = semantic_changes_by_line(rhs_positions);
     let mut chunks = Vec::new();
     let mut current_lines = Vec::new();
     let mut max_lhs_line: Option<LineNumber> = None;
@@ -437,10 +437,10 @@ fn text_positions_to_semantic(
             lhs_line: lhs_line_num.map(|l| l.0),
             rhs_line: rhs_line_num.map(|l| l.0),
             lhs_changes: lhs_line_num
-                .and_then(|ln| lhs_changes_by_line.get(&ln).cloned())
+                .and_then(|ln| lhs_changes_by_line.remove(&ln))
                 .unwrap_or_default(),
             rhs_changes: rhs_line_num
-                .and_then(|ln| rhs_changes_by_line.get(&ln).cloned())
+                .and_then(|ln| rhs_changes_by_line.remove(&ln))
                 .unwrap_or_default(),
         });
 
