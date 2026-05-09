@@ -1,6 +1,5 @@
 //! Load and configure parsers written with tree-sitter.
 
-#[cfg(feature = "static-languages")]
 use std::cell::RefCell;
 #[cfg(feature = "static-languages")]
 use std::collections::HashMap;
@@ -1538,6 +1537,29 @@ mod dynamic {
     }
 }
 
+thread_local! {
+    static PARSER: RefCell<ts::Parser> = RefCell::new(ts::Parser::new());
+}
+
+fn parse_tree_with_ranges(
+    source: &str,
+    language: &ts::Language,
+    included_ranges: &[ts::Range],
+) -> Result<tree_sitter::Tree, DifftasticError> {
+    PARSER.with(|parser| {
+        let mut parser = parser.borrow_mut();
+        parser
+            .set_language(language)
+            .map_err(|error| DifftasticError::new(error.to_string()))?;
+        parser
+            .set_included_ranges(included_ranges)
+            .map_err(|error| DifftasticError::new(error.to_string()))?;
+        parser
+            .parse(source, None)
+            .ok_or_else(|| DifftasticError::new("tree-sitter parse failed"))
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn highlight_ranges(
     source: &str,
@@ -1548,13 +1570,7 @@ pub(crate) fn highlight_ranges(
     }
 
     let config = from_language(language)?;
-    let mut parser = ts::Parser::new();
-    parser
-        .set_language(&config.language)
-        .map_err(|error| DifftasticError::new(error.to_string()))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| DifftasticError::new("tree-sitter parse failed"))?;
+    let tree = parse_tree_with_ranges(source, &config.language, &[])?;
 
     let capture_kinds = config
         .highlight_query
@@ -1646,12 +1662,7 @@ fn capture_name_to_highlight_kind(name: &str) -> HighlightKind {
 
 /// Parse `src` with tree-sitter.
 pub(crate) fn to_tree(src: &str, config: &TreeSitterConfig) -> tree_sitter::Tree {
-    let mut parser = ts::Parser::new();
-    parser
-        .set_language(&config.language)
-        .expect("Incompatible tree-sitter version");
-
-    parser.parse(src, None).unwrap()
+    parse_tree_with_ranges(src, &config.language, &[]).expect("tree-sitter parse failed")
 }
 
 #[derive(Debug)]
@@ -1695,15 +1706,8 @@ pub(crate) fn parse_subtrees(
             let Ok(subconfig) = from_language(language.parse_as) else {
                 continue;
             };
-            let mut parser = ts::Parser::new();
-            parser
-                .set_language(&subconfig.language)
-                .expect("Incompatible tree-sitter version");
-            parser
-                .set_included_ranges(&[node.range()])
-                .expect("Incompatible tree-sitter version");
-
-            let tree = parser.parse(src, None).unwrap();
+            let tree = parse_tree_with_ranges(src, &subconfig.language, &[node.range()])
+                .expect("tree-sitter subtree parse failed");
             let sub_highlights = tree_highlights(&tree, src, &subconfig);
 
             subtrees.insert(node.id(), (tree, subconfig, sub_highlights));
