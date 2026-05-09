@@ -1,5 +1,11 @@
 //! Load and configure parsers written with tree-sitter.
 
+#[cfg(feature = "static-languages")]
+use std::cell::RefCell;
+#[cfg(feature = "static-languages")]
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use line_numbers::LinePositions;
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter as ts;
@@ -95,12 +101,32 @@ const OCAML_ATOM_NODES: [&str; 6] = [
 
 pub(crate) fn from_language(
     language: guess::Language,
-) -> Result<TreeSitterConfig, DifftasticError> {
+) -> Result<Rc<TreeSitterConfig>, DifftasticError> {
     from_language_impl(language)
 }
 
 #[cfg(feature = "static-languages")]
-fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, DifftasticError> {
+fn from_language_impl(language: guess::Language) -> Result<Rc<TreeSitterConfig>, DifftasticError> {
+    thread_local! {
+        static CONFIGS: RefCell<HashMap<guess::Language, Rc<TreeSitterConfig>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    CONFIGS.with(|configs| {
+        let mut configs = configs.borrow_mut();
+        if let Some(config) = configs.get(&language) {
+            return Ok(Rc::clone(config));
+        }
+        let config = Rc::new(build_static_language_config(language)?);
+        configs.insert(language, Rc::clone(&config));
+        Ok(config)
+    })
+}
+
+#[cfg(feature = "static-languages")]
+fn build_static_language_config(
+    language: guess::Language,
+) -> Result<TreeSitterConfig, DifftasticError> {
     use guess::Language::*;
     Ok(match language {
         Ada => {
@@ -1195,12 +1221,12 @@ fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, Dif
 }
 
 #[cfg(all(not(feature = "static-languages"), feature = "dynamic-languages"))]
-fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, DifftasticError> {
+fn from_language_impl(language: guess::Language) -> Result<Rc<TreeSitterConfig>, DifftasticError> {
     dynamic::from_language(language)
 }
 
 #[cfg(not(any(feature = "static-languages", feature = "dynamic-languages")))]
-fn from_language_impl(language: guess::Language) -> Result<TreeSitterConfig, DifftasticError> {
+fn from_language_impl(language: guess::Language) -> Result<Rc<TreeSitterConfig>, DifftasticError> {
     Err(DifftasticError::new(format!(
         "no tree-sitter language provider compiled for {:?}",
         language
@@ -1240,21 +1266,35 @@ mod dynamic {
     }
 
     thread_local! {
+        static CONFIGS: RefCell<HashMap<guess::Language, Rc<TreeSitterConfig>>> =
+            RefCell::new(HashMap::new());
         static LIBRARIES: RefCell<HashMap<PathBuf, Rc<libloading::Library>>> =
             RefCell::new(HashMap::new());
     }
 
     pub(super) fn from_language(
         language: guess::Language,
-    ) -> Result<TreeSitterConfig, DifftasticError> {
-        let pack_language = pack_language_name(language).ok_or_else(|| {
-            DifftasticError::new(format!(
-                "dynamic parser pack unavailable for {:?}",
-                language
-            ))
-        })?;
-        let (tree_sitter_language, query_source) = load_pack(pack_language)?;
-        tree_sitter_config(language, tree_sitter_language, &query_source)
+    ) -> Result<Rc<TreeSitterConfig>, DifftasticError> {
+        CONFIGS.with(|configs| {
+            let mut configs = configs.borrow_mut();
+            if let Some(config) = configs.get(&language) {
+                return Ok(Rc::clone(config));
+            }
+            let pack_language = pack_language_name(language).ok_or_else(|| {
+                DifftasticError::new(format!(
+                    "dynamic parser pack unavailable for {:?}",
+                    language
+                ))
+            })?;
+            let (tree_sitter_language, query_source) = load_pack(pack_language)?;
+            let config = Rc::new(tree_sitter_config(
+                language,
+                tree_sitter_language,
+                &query_source,
+            )?);
+            configs.insert(language, Rc::clone(&config));
+            Ok(config)
+        })
     }
 
     fn pack_language_name(language: guess::Language) -> Option<&'static str> {
@@ -1638,7 +1678,7 @@ pub(crate) fn parse_subtrees(
     src: &str,
     config: &TreeSitterConfig,
     tree: &tree_sitter::Tree,
-) -> DftHashMap<usize, (tree_sitter::Tree, TreeSitterConfig, HighlightedNodeIds)> {
+) -> DftHashMap<usize, (tree_sitter::Tree, Rc<TreeSitterConfig>, HighlightedNodeIds)> {
     let mut subtrees = DftHashMap::default();
 
     for language in &config.sub_languages {
@@ -1985,7 +2025,7 @@ fn all_syntaxes_from_cursor<'a>(
     error_count: &mut usize,
     config: &TreeSitterConfig,
     highlights: &HighlightedNodeIds,
-    subtrees: &DftHashMap<usize, (tree_sitter::Tree, TreeSitterConfig, HighlightedNodeIds)>,
+    subtrees: &DftHashMap<usize, (tree_sitter::Tree, Rc<TreeSitterConfig>, HighlightedNodeIds)>,
     ignore_comments: bool,
 ) -> Vec<&'a Syntax<'a>> {
     let mut nodes: Vec<&Syntax> = vec![];
@@ -2021,7 +2061,7 @@ fn syntax_from_cursor<'a>(
     error_count: &mut usize,
     config: &TreeSitterConfig,
     highlights: &HighlightedNodeIds,
-    subtrees: &DftHashMap<usize, (tree_sitter::Tree, TreeSitterConfig, HighlightedNodeIds)>,
+    subtrees: &DftHashMap<usize, (tree_sitter::Tree, Rc<TreeSitterConfig>, HighlightedNodeIds)>,
     ignore_comments: bool,
 ) -> Option<&'a Syntax<'a>> {
     let node = cursor.node();
@@ -2085,7 +2125,7 @@ fn list_from_cursor<'a>(
     error_count: &mut usize,
     config: &TreeSitterConfig,
     highlights: &HighlightedNodeIds,
-    subtrees: &DftHashMap<usize, (tree_sitter::Tree, TreeSitterConfig, HighlightedNodeIds)>,
+    subtrees: &DftHashMap<usize, (tree_sitter::Tree, Rc<TreeSitterConfig>, HighlightedNodeIds)>,
     ignore_comments: bool,
 ) -> &'a Syntax<'a> {
     let root_node = cursor.node();
