@@ -164,6 +164,8 @@ pub struct DiffRequest<'a> {
 }
 
 const SEMANTIC_CHUNK_MAX_DISTANCE: u32 = 4;
+const SEMANTIC_PARSE_ERROR_LIMIT_ENV: &str = "DFT_PARSE_ERROR_LIMIT";
+const SEMANTIC_DEFAULT_PARSE_ERROR_LIMIT: usize = 100;
 const TIMINGS_ENV: &str = "DFT_TIMINGS";
 
 struct TimingLog<'a> {
@@ -238,7 +240,7 @@ pub fn diff_bytes_semantic(
         file_argument_for_side(request.lhs_path, request.display_path, request.lhs_bytes);
     let rhs_path =
         file_argument_for_side(request.rhs_path, request.display_path, request.rhs_bytes);
-    let diff_options = DiffOptions::default();
+    let diff_options = semantic_diff_options();
     let overrides = Vec::<(LanguageOverride, Vec<glob::Pattern>)>::new();
     let binary_overrides = Vec::<glob::Pattern>::new();
 
@@ -252,6 +254,20 @@ pub fn diff_bytes_semantic(
         &overrides,
         &binary_overrides,
     ))
+}
+
+fn semantic_diff_options() -> DiffOptions {
+    let mut options = DiffOptions::default();
+    // Tree-sitter parse errors are common in macro-heavy real-world code such
+    // as the Linux kernel. Diffy's semantic API prefers best-effort AST diffs
+    // over immediately falling back to line diff for a handful of ERROR nodes.
+    // Keep the upstream CLI default unchanged, and let DFT_PARSE_ERROR_LIMIT
+    // override this for debugging or stricter behavior.
+    options.parse_error_limit = std::env::var(SEMANTIC_PARSE_ERROR_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SEMANTIC_DEFAULT_PARSE_ERROR_LIMIT);
+    options
 }
 
 fn diff_bytes_semantic_impl(
@@ -1041,7 +1057,20 @@ fn diff_file_content(
 }
 #[cfg(test)]
 mod semantic_tests {
-    use super::{diff_bytes_semantic, DiffRequest, DiffStatus};
+    use super::{
+        diff_bytes_semantic, semantic_diff_options, DiffRequest, DiffStatus,
+        SEMANTIC_DEFAULT_PARSE_ERROR_LIMIT, SEMANTIC_PARSE_ERROR_LIMIT_ENV,
+    };
+
+    #[test]
+    fn semantic_diff_allows_best_effort_parse_errors_by_default() {
+        if std::env::var_os(SEMANTIC_PARSE_ERROR_LIMIT_ENV).is_none() {
+            assert_eq!(
+                semantic_diff_options().parse_error_limit,
+                SEMANTIC_DEFAULT_PARSE_ERROR_LIMIT
+            );
+        }
+    }
 
     #[test]
     fn semantic_diff_uses_paths_for_created_and_deleted_empty_files() {
