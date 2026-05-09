@@ -49,7 +49,7 @@ use crate::diff::unchanged;
 use crate::display::context::opposite_positions;
 use crate::display::hunks::{matched_pos_to_hunks, merge_adjacent};
 use crate::files::{guess_content, ProbableFileKind};
-use crate::hash::DftHashMap;
+use crate::hash::{DftHashMap, DftHashSet};
 use crate::lines::MaxLine;
 use crate::options::{DiffOptions, DisplayOptions, FileArgument};
 use crate::parse::guess_language::{guess, language_name, Language, LanguageOverride};
@@ -164,7 +164,7 @@ pub struct DiffRequest<'a> {
     pub rhs_bytes: &'a [u8],
 }
 
-const SEMANTIC_CHUNK_MAX_DISTANCE: u32 = 4;
+const SEMANTIC_CONTEXT_LINES: usize = 3;
 const SEMANTIC_PARSE_ERROR_LIMIT_ENV: &str = "DFT_PARSE_ERROR_LIMIT";
 const SEMANTIC_DEFAULT_PARSE_ERROR_LIMIT: usize = 100;
 const TIMINGS_ENV: &str = "DFT_TIMINGS";
@@ -438,54 +438,26 @@ fn text_positions_to_semantic(
         .collect();
     let mut lhs_changes_by_line = semantic_changes_by_line(lhs_positions);
     let mut rhs_changes_by_line = semantic_changes_by_line(rhs_positions);
-    let mut chunks = Vec::new();
-    let mut current_lines = Vec::new();
-    let mut max_lhs_line: Option<LineNumber> = None;
-    let mut max_rhs_line: Option<LineNumber> = None;
-
-    for (lhs_line_num, rhs_line_num) in matched_lines {
-        let lhs_novel = lhs_line_num
-            .map(|l| lhs_lines_with_novel.contains(&l))
-            .unwrap_or(false);
-        let rhs_novel = rhs_line_num
-            .map(|l| rhs_lines_with_novel.contains(&l))
-            .unwrap_or(false);
-        if !lhs_novel && !rhs_novel {
-            continue;
-        }
-
-        if !current_lines.is_empty()
-            && !semantic_lines_are_close(max_lhs_line, max_rhs_line, lhs_line_num, rhs_line_num)
-        {
-            chunks.push(SemanticChunk {
-                lines: std::mem::take(&mut current_lines),
-            });
-        }
-
-        current_lines.push(SemanticLine {
-            lhs_line: lhs_line_num.map(|l| l.0),
-            rhs_line: rhs_line_num.map(|l| l.0),
-            lhs_changes: lhs_line_num
-                .and_then(|ln| lhs_changes_by_line.remove(&ln))
-                .unwrap_or_default(),
-            rhs_changes: rhs_line_num
-                .and_then(|ln| rhs_changes_by_line.remove(&ln))
-                .unwrap_or_default(),
-        });
-
-        if let Some(lhs_line_num) = lhs_line_num {
-            max_lhs_line = Some(lhs_line_num);
-        }
-        if let Some(rhs_line_num) = rhs_line_num {
-            max_rhs_line = Some(rhs_line_num);
-        }
-    }
-
-    if !current_lines.is_empty() {
-        chunks.push(SemanticChunk {
-            lines: current_lines,
-        });
-    }
+    let chunks =
+        semantic_chunk_ranges(&matched_lines, &lhs_lines_with_novel, &rhs_lines_with_novel)
+            .into_iter()
+            .map(|(start, end)| {
+                let lines = matched_lines[start..end]
+                    .iter()
+                    .map(|(lhs_line_num, rhs_line_num)| SemanticLine {
+                        lhs_line: lhs_line_num.map(|l| l.0),
+                        rhs_line: rhs_line_num.map(|l| l.0),
+                        lhs_changes: lhs_line_num
+                            .and_then(|ln| lhs_changes_by_line.remove(&ln))
+                            .unwrap_or_default(),
+                        rhs_changes: rhs_line_num
+                            .and_then(|ln| rhs_changes_by_line.remove(&ln))
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+                SemanticChunk { lines }
+            })
+            .collect::<Vec<_>>();
 
     if chunks.is_empty() {
         SemanticDiffResult {
@@ -506,24 +478,37 @@ fn text_positions_to_semantic(
     }
 }
 
-fn semantic_lines_are_close(
-    max_lhs: Option<LineNumber>,
-    max_rhs: Option<LineNumber>,
-    lhs: Option<LineNumber>,
-    rhs: Option<LineNumber>,
-) -> bool {
-    if let (Some(max_lhs), Some(lhs)) = (max_lhs, lhs) {
-        if lhs.0 <= max_lhs.0 + SEMANTIC_CHUNK_MAX_DISTANCE {
-            return true;
+fn semantic_chunk_ranges(
+    matched_lines: &[(Option<LineNumber>, Option<LineNumber>)],
+    lhs_lines_with_novel: &DftHashSet<LineNumber>,
+    rhs_lines_with_novel: &DftHashSet<LineNumber>,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for (idx, (lhs_line_num, rhs_line_num)) in matched_lines.iter().enumerate() {
+        let lhs_novel = lhs_line_num
+            .map(|line| lhs_lines_with_novel.contains(&line))
+            .unwrap_or(false);
+        let rhs_novel = rhs_line_num
+            .map(|line| rhs_lines_with_novel.contains(&line))
+            .unwrap_or(false);
+        if !lhs_novel && !rhs_novel {
+            continue;
         }
-    }
-    if let (Some(max_rhs), Some(rhs)) = (max_rhs, rhs) {
-        if rhs.0 <= max_rhs.0 + SEMANTIC_CHUNK_MAX_DISTANCE {
-            return true;
-        }
-    }
 
-    false
+        let start = idx.saturating_sub(SEMANTIC_CONTEXT_LINES);
+        let end = idx
+            .saturating_add(SEMANTIC_CONTEXT_LINES)
+            .saturating_add(1)
+            .min(matched_lines.len());
+        if let Some((_, last_end)) = ranges.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        ranges.push((start, end));
+    }
+    ranges
 }
 
 fn semantic_changes_by_line(
@@ -1085,6 +1070,25 @@ mod semantic_tests {
                 SEMANTIC_DEFAULT_PARSE_ERROR_LIMIT
             );
         }
+    }
+
+    #[test]
+    fn semantic_diff_includes_context_lines_for_snippets() {
+        let result = diff_bytes_semantic(DiffRequest {
+            display_path: "notes.txt",
+            lhs_path: Some(std::path::Path::new("notes.txt")),
+            rhs_path: Some(std::path::Path::new("notes.txt")),
+            lhs_bytes: b"one\ntwo\nthree\n",
+            rhs_bytes: b"one\nTWO\nthree\n",
+        })
+        .unwrap();
+
+        assert_eq!(result.status, DiffStatus::Changed);
+        assert_eq!(result.chunks.len(), 1);
+        let lines = &result.chunks[0].lines;
+        assert_eq!(lines.first().and_then(|line| line.lhs_line), Some(0));
+        assert!(lines.iter().any(|line| line.lhs_line == Some(2)));
+        assert!(lines.iter().any(|line| line.rhs_line == Some(2)));
     }
 
     #[test]
